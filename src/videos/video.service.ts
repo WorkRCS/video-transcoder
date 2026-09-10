@@ -33,6 +33,7 @@ interface ProbeResult {
 }
 
 interface Rendition {
+  name: string;
   height: number;
   bitrate: string;
   maxrate: string;
@@ -130,8 +131,15 @@ export class VideoService {
 
       const masterPath = join(outputDir, 'master.m3u8');
       const dashPath = join(outputDir, 'manifest.mpd');
-      if (!existsSync(masterPath) || !existsSync(dashPath)) {
-        throw new Error('FFmpeg finished without producing both HLS and DASH manifests.');
+      if (!existsSync(dashPath)) {
+        const contents = await this.listOutputFiles(outputDir);
+        throw new Error(`FFmpeg completed without producing manifest.mpd. Output files: ${contents.join(', ') || 'none'}`);
+      }
+      if (!existsSync(masterPath)) {
+        await this.createHlsMasterPlaylist(outputDir, this.getRenditions(sourceHeight));
+      }
+      if (!existsSync(masterPath)) {
+        throw new Error('FFmpeg completed, but the HLS master playlist could not be created.');
       }
 
       job.status = 'ready';
@@ -146,16 +154,22 @@ export class VideoService {
 
   private getRenditions(sourceHeight: number): Rendition[] {
     const candidates: Rendition[] = [
-      { height: 1080, bitrate: '5000k', maxrate: '5350k', bufsize: '10000k' },
-      { height: 720, bitrate: '3000k', maxrate: '3210k', bufsize: '6000k' },
-      { height: 480, bitrate: '1500k', maxrate: '1605k', bufsize: '3000k' },
-      { height: 360, bitrate: '800k', maxrate: '856k', bufsize: '1600k' },
+      { name: '1080p', height: 1080, bitrate: '5000k', maxrate: '5350k', bufsize: '10000k' },
+      { name: '720p', height: 720, bitrate: '3000k', maxrate: '3210k', bufsize: '6000k' },
+      { name: '480p', height: 480, bitrate: '1500k', maxrate: '1605k', bufsize: '3000k' },
+      { name: '360p', height: 360, bitrate: '800k', maxrate: '856k', bufsize: '1600k' },
     ];
 
     const available = candidates.filter((r) => sourceHeight >= r.height);
     return available.length > 0
       ? available
-      : [{ height: Math.max(240, Math.floor(sourceHeight / 2) * 2), bitrate: '800k', maxrate: '856k', bufsize: '1600k' }];
+      : [{
+          name: `${Math.max(240, Math.floor(sourceHeight / 2) * 2)}p`,
+          height: Math.max(240, Math.floor(sourceHeight / 2) * 2),
+          bitrate: '800k',
+          maxrate: '856k',
+          bufsize: '1600k',
+        }];
   }
 
   private async probe(inputPath: string): Promise<ProbeResult> {
@@ -198,11 +212,10 @@ export class VideoService {
     const { id, inputPath, outputDir, duration, sourceWidth, sourceHeight, renditions, hasAudio } = params;
     const filterParts: string[] = [];
     const splitLabels = renditions.map((_, index) => `[v${index}]`).join('');
-    const sourceDar = sourceHeight > 0 ? `${sourceWidth}/${sourceHeight}` : '16/9';
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
     renditions.forEach((rendition, index) => {
       filterParts.push(
-        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1,setdar=${sourceDar}[out${index}]`,
+        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`,
       );
       if (index !== renditions.length - 1) filterParts.push(';');
     });
@@ -240,6 +253,8 @@ export class VideoService {
       ? `id=0,streams=${videoStreamIndexes} id=1,streams=${renditions.length}`
       : `id=0,streams=${videoStreamIndexes}`;
 
+    // RepresentationID-based directories keep each encoded representation isolated:
+    // stream/0/, stream/1/, stream/2/, ...; the root retains the DASH MPD and HLS playlists.
     args.push(
       '-f', 'dash',
       '-dash_segment_type', 'mp4',
@@ -251,12 +266,17 @@ export class VideoService {
       '-hls_playlist', '1',
       '-hls_master_name', 'master.m3u8',
       '-adaptation_sets', adaptationSets,
-      '-init_seg_name', 'init-$RepresentationID$.m4s',
-      '-media_seg_name', 'chunk-$RepresentationID$-$Number%05d$.m4s',
+      '-init_seg_name', '$RepresentationID$/init.m4s',
+      '-media_seg_name', '$RepresentationID$/chunk-$Number%05d$.m4s',
       '-progress', 'pipe:1',
       '-nostats',
       join(outputDir, 'manifest.mpd'),
     );
+
+    await fs.mkdir(outputDir, { recursive: true });
+    for (let index = 0; index < renditions.length + (hasAudio ? 1 : 0); index += 1) {
+      await fs.mkdir(join(outputDir, String(index)), { recursive: true });
+    }
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -318,9 +338,44 @@ export class VideoService {
           resolve();
           return;
         }
-        finishError(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-8000)}`));
+        finishError(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-10000)}`));
       });
     });
+  }
+
+  private async createHlsMasterPlaylist(outputDir: string, renditions: Rendition[]): Promise<void> {
+    const mediaPlaylists: Array<{ name: string; bitrate: number; resolution: string }> = [];
+    for (let index = 0; index < renditions.length; index += 1) {
+      const playlistPath = join(outputDir, `media_${index}.m3u8`);
+      if (!existsSync(playlistPath)) continue;
+      const rendition = renditions[index];
+      const bitrate = Number.parseInt(rendition.bitrate, 10) * 1000;
+      const width = Math.max(2, Math.round((rendition.height * 9) / 16 / 2) * 2);
+      mediaPlaylists.push({
+        name: `media_${index}.m3u8`,
+        bitrate,
+        resolution: `${width}x${rendition.height}`,
+      });
+    }
+    if (mediaPlaylists.length === 0) return;
+
+    const lines = ['#EXTM3U', '#EXT-X-VERSION:7'];
+    for (const playlist of mediaPlaylists) {
+      lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${playlist.bitrate},RESOLUTION=${playlist.resolution}`);
+      lines.push(playlist.name);
+    }
+    await fs.writeFile(join(outputDir, 'master.m3u8'), `${lines.join('\n')}\n`, 'utf8');
+  }
+
+  private async listOutputFiles(root: string, prefix = ''): Promise<string[]> {
+    const result: string[] = [];
+    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => [] as import('node:fs').Dirent[]);
+    for (const entry of entries) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) result.push(...await this.listOutputFiles(join(root, entry.name), relative));
+      else result.push(relative);
+    }
+    return result;
   }
 
   private failJob(id: string, error: unknown): void {
@@ -352,9 +407,7 @@ export class VideoService {
       const expired = (job.status === 'ready' || job.status === 'error') && age > this.ttlMs;
       const stuck = job.status === 'processing' && age > this.encodingTimeoutMs;
       const abandonedQueue = job.status === 'queued' && Date.parse(job.createdAt) < cutoff;
-      if (expired || stuck || abandonedQueue) {
-        await this.deleteJob(job.id);
-      }
+      if (expired || stuck || abandonedQueue) await this.deleteJob(job.id);
     }
   }
 }
