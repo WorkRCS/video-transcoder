@@ -1,0 +1,45 @@
+{
+  "name": "faststream-video",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Guest video transcoder with HLS + MPEG-DASH output.",
+  "scripts": {
+    "build": "nest build && npm run web:build",
+    "web:build": "tailwindcss -i ./public/input.css -o ./public/styles.css --minify",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main.js",
+    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.6",
+    "@nestjs/core": "^11.1.6",
+    "@nestjs/platform-express": "^11.1.6",
+    "@nestjs/serve-static": "^5.0.4",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^5.2.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.10",
+    "@nestjs/schematics": "^11.0.7",
+    "@nestjs/testing": "^11.1.6",
+    "@tailwindcss/cli": "^4.1.13",
+    "@types/express": "^5.0.3",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^22.18.3",
+    "eslint": "^9.35.0",
+    "prettier": "^3.6.2",
+    "tailwindcss": "^4.1.13",
+    "ts-node": "^10.9.2",
+    "ts-loader": "^9.5.4",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}
