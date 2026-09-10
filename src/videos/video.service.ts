@@ -66,6 +66,7 @@ export class VideoService {
     const id = randomUUID();
     const inputDir = join(this.jobsRoot, id, 'input');
     mkdirSync(inputDir, { recursive: true });
+
     const safeExt = extname(file.originalname).toLowerCase() || '.mp4';
     const inputPath = join(inputDir, `source${safeExt}`);
     const now = new Date().toISOString();
@@ -79,6 +80,7 @@ export class VideoService {
       updatedAt: now,
       inputPath,
     };
+
     this.jobs.set(id, job);
 
     void fs.rename(file.path, inputPath)
@@ -126,8 +128,11 @@ export class VideoService {
     this.pumping = true;
     try {
       while (this.activeJobs < this.maxConcurrentJobs) {
-        const next = [...this.jobs.values()].find((job) => job.status === 'queued' && existsSync(job.inputPath));
+        const next = [...this.jobs.values()].find(
+          (job) => job.status === 'queued' && existsSync(job.inputPath),
+        );
         if (!next) break;
+
         this.activeJobs += 1;
         void this.processJob(next.id).finally(() => {
           this.activeJobs -= 1;
@@ -142,6 +147,7 @@ export class VideoService {
   private async processJob(id: string): Promise<void> {
     const job = this.jobs.get(id);
     if (!job) return;
+
     try {
       job.status = 'processing';
       job.progress = 3;
@@ -149,11 +155,14 @@ export class VideoService {
 
       const probe = await this.probe(job.inputPath);
       const video = probe.streams?.find((stream) => stream.codec_type === 'video');
-      if (!video?.width || !video.height) throw new Error('Input does not contain a valid video stream.');
+      if (!video?.width || !video.height) {
+        throw new Error('Input does not contain a valid video stream.');
+      }
 
       const duration = Number(probe.format?.duration ?? 0);
       const hasAudio = probe.streams?.some((stream) => stream.codec_type === 'audio') ?? false;
       const renditions = this.getRenditions(video.height);
+
       job.durationSeconds = Number.isFinite(duration) && duration > 0 ? duration : undefined;
       job.sourceHeight = video.height;
       job.updatedAt = new Date().toISOString();
@@ -162,7 +171,17 @@ export class VideoService {
       await fs.rm(outputDir, { recursive: true, force: true });
       await fs.mkdir(outputDir, { recursive: true });
 
-      await this.encodeWithFfmpeg({ id, inputPath: job.inputPath, outputDir, duration, renditions, hasAudio });
+      await this.encodeWithFfmpeg({
+        id,
+        inputPath: job.inputPath,
+        outputDir,
+        duration,
+        sourceWidth: video.width,
+        sourceHeight: video.height,
+        renditions,
+        hasAudio,
+      });
+
       await this.organizeOutputs(outputDir, renditions, hasAudio);
       await this.validateOutputs(outputDir, renditions, hasAudio);
 
@@ -178,7 +197,9 @@ export class VideoService {
       this.failJob(id, error);
     } finally {
       const current = this.jobs.get(id);
-      if (current) current.inputPath = current.inputPath;
+      if (current?.inputPath) {
+        await fs.rm(current.inputPath, { force: true }).catch(() => undefined);
+      }
       this.processes.delete(id);
     }
   }
@@ -190,8 +211,10 @@ export class VideoService {
       { name: '480p', height: 480, bitrate: '1500k', maxrate: '1605k', bufsize: '3000k' },
       { name: '360p', height: 360, bitrate: '800k', maxrate: '856k', bufsize: '1600k' },
     ];
+
     const available = candidates.filter((rendition) => sourceHeight >= rendition.height);
     if (available.length) return available;
+
     const height = Math.max(240, Math.floor(sourceHeight / 2) * 2);
     return [{ name: `${height}p`, height, bitrate: '800k', maxrate: '856k', bufsize: '1600k' }];
   }
@@ -199,15 +222,30 @@ export class VideoService {
   private async probe(inputPath: string): Promise<ProbeResult> {
     const executable = ffprobeStatic.path;
     if (!executable) throw new InternalServerErrorException('FFprobe binary is unavailable.');
+
     return new Promise((resolve, reject) => {
       execFile(
         executable,
-        ['-v', 'error', '-show_entries', 'format=duration:stream=width,height,codec_type', '-of', 'json', inputPath],
+        [
+          '-v',
+          'error',
+          '-show_entries',
+          'format=duration:stream=width,height,codec_type',
+          '-of',
+          'json',
+          inputPath,
+        ],
         { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout, stderr) => {
-          if (error) return reject(new Error(`Unable to inspect video: ${stderr || error.message}`));
-          try { resolve(JSON.parse(stdout) as ProbeResult); }
-          catch { reject(new Error('FFprobe returned invalid metadata.')); }
+          if (error) {
+            reject(new Error(`Unable to inspect video: ${stderr || error.message}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout) as ProbeResult);
+          } catch {
+            reject(new Error('FFprobe returned invalid metadata.'));
+          }
         },
       );
     });
@@ -218,50 +256,113 @@ export class VideoService {
     inputPath: string;
     outputDir: string;
     duration: number;
+    sourceWidth: number;
+    sourceHeight: number;
     renditions: Rendition[];
     hasAudio: boolean;
   }): Promise<void> {
     const executable = ffmpegPath;
     if (!executable) throw new InternalServerErrorException('FFmpeg binary is unavailable.');
-    const { id, inputPath, outputDir, duration, renditions, hasAudio } = params;
 
+    const { id, inputPath, outputDir, duration, sourceWidth, sourceHeight, renditions, hasAudio } = params;
+    const sourceDar = `${sourceWidth}/${sourceHeight}`;
     const labels = renditions.map((_, index) => `[v${index}]`).join('');
     const filters = [`[0:v]split=${renditions.length}${labels}`];
+
+    for (let index = 0; index < renditions.length; index += 1) {
+      const rendition = renditions[index];
+      // Do not crop to a pixel-only ratio and then force SAR=1. That creates tiny
+      // DAR differences such as 608x1080 vs 404x720, which FFmpeg's DASH muxer rejects.
+      // setdar preserves the original display aspect ratio across every rendition.
+      filters.push(
+        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,setdar=${sourceDar}[out${index}]`,
+      );
+    }
+
+    const args: string[] = [
+      '-hide_banner',
+      '-y',
+      '-i',
+      inputPath,
+      '-filter_complex',
+      filters.join(';'),
+    ];
+
     renditions.forEach((rendition, index) => {
-      filters.push(`[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`);
+      args.push(
+        '-map',
+        `[out${index}]`,
+        `-c:v:${index}`,
+        'libx264',
+        '-preset',
+        this.preset,
+        `-b:v:${index}`,
+        rendition.bitrate,
+        `-maxrate:v:${index}`,
+        rendition.maxrate,
+        `-bufsize:v:${index}`,
+        rendition.bufsize,
+        `-pix_fmt:v:${index}`,
+        'yuv420p',
+        `-g:v:${index}`,
+        '48',
+        `-keyint_min:v:${index}`,
+        '48',
+        `-sc_threshold:v:${index}`,
+        '0',
+      );
     });
 
-    const args: string[] = ['-hide_banner', '-y', '-i', inputPath, '-filter_complex', filters.join(';')];
-    renditions.forEach((rendition, index) => {
-      args.push('-map', `[out${index}]`, `-c:v:${index}`, 'libx264', '-preset', this.preset,
-        `-b:v:${index}`, rendition.bitrate, `-maxrate:v:${index}`, rendition.maxrate,
-        `-bufsize:v:${index}`, rendition.bufsize, `-pix_fmt:v:${index}`, 'yuv420p',
-        `-g:v:${index}`, '48', `-keyint_min:v:${index}`, '48', `-sc_threshold:v:${index}`, '0');
-    });
-    if (hasAudio) args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
+    if (hasAudio) {
+      args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
+    }
 
-    const videoIndexes = renditions.map((_, index) => index).join(',');
-    const adaptationSets = hasAudio ? `id=0,streams=${videoIndexes} id=1,streams=${renditions.length}` : `id=0,streams=${videoIndexes}`;
     args.push(
-      '-f', 'dash', '-dash_segment_type', 'mp4', '-seg_duration', '4', '-frag_duration', '1',
-      '-use_template', '1', '-use_timeline', '1', '-remove_at_exit', '0',
-      '-hls_playlist', '1', '-hls_master_name', 'master.m3u8', '-adaptation_sets', adaptationSets,
-      '-init_seg_name', 'init-$RepresentationID$.m4s',
-      '-media_seg_name', 'chunk-$RepresentationID$-$Number%05d$.m4s',
-      '-progress', 'pipe:1', '-nostats', join(outputDir, 'manifest.mpd'),
+      '-f',
+      'dash',
+      '-dash_segment_type',
+      'mp4',
+      '-seg_duration',
+      '4',
+      '-frag_duration',
+      '1',
+      '-use_template',
+      '1',
+      '-use_timeline',
+      '1',
+      '-remove_at_exit',
+      '0',
+      '-hls_playlist',
+      '1',
+      '-hls_master_name',
+      'master.m3u8',
+      '-adaptation_sets',
+      hasAudio ? 'id=0,streams=v id=1,streams=a' : 'id=0,streams=v',
+      '-init_seg_name',
+      'init-$RepresentationID$.m4s',
+      '-media_seg_name',
+      'chunk-$RepresentationID$-$Number%05d$.m4s',
+      '-progress',
+      'pipe:1',
+      '-nostats',
+      join(outputDir, 'manifest.mpd'),
     );
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       this.processes.set(id, child);
+
       let stdoutBuffer = '';
       const stderrTail: string[] = [];
       let settled = false;
+      const startedAt = Date.now();
+
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
         error ? reject(error) : resolve();
       };
+
       const timeout = setTimeout(() => {
         if (!child.killed) child.kill('SIGKILL');
         finish(new Error(`Encoding timed out after ${Math.round(this.encodingTimeoutMs / 60_000)} minutes.`));
@@ -271,45 +372,65 @@ export class VideoService {
         stdoutBuffer += chunk.toString('utf8');
         const lines = stdoutBuffer.split(/\r?\n/);
         stdoutBuffer = lines.pop() ?? '';
+
         for (const line of lines) {
           const [key, value] = line.split('=', 2);
-          if (!value) continue;
-          if (key === 'out_time_us' || key === 'out_time_ms') {
-            const seconds = Number(value) / 1_000_000;
-            const ratio = duration > 0 ? Math.min(1, seconds / duration) : 0;
-            const current = this.jobs.get(id);
-            if (current) current.progress = Math.max(4, Math.min(98, Math.round(ratio * 95) + 3));
+          if (!value || (key !== 'out_time_us' && key !== 'out_time_ms')) continue;
+          const seconds = Number(value) / 1_000_000;
+          const ratio = duration > 0 ? Math.min(1, seconds / duration) : 0;
+          const current = this.jobs.get(id);
+          if (current) {
+            current.progress = Math.max(4, Math.min(98, Math.round(ratio * 95) + 3));
+            current.updatedAt = new Date().toISOString();
           }
         }
       });
+
       child.stderr.on('data', (chunk: Buffer) => {
         stderrTail.push(...chunk.toString('utf8').split(/\r?\n/).filter(Boolean));
-        while (stderrTail.length > 120) stderrTail.shift();
+        while (stderrTail.length > 160) stderrTail.shift();
       });
-      child.on('error', (error) => { clearTimeout(timeout); finish(error); });
+
+      child.on('error', (error) => {
+        clearTimeout(timeout);
+        finish(error);
+      });
+
       child.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (settled) return;
-        if (code === 0) finish();
-        else finish(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-12000)}`));
+        if (code === 0) {
+          console.log(`[transcoder:${id}] FFmpeg completed in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+          finish();
+          return;
+        }
+        finish(
+          new Error(
+            `FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-16000)}`,
+          ),
+        );
       });
     });
   }
 
   private async organizeOutputs(outputDir: string, renditions: Rendition[], hasAudio: boolean): Promise<void> {
     const totalStreams = renditions.length + (hasAudio ? 1 : 0);
+
     for (let index = 0; index < totalStreams; index += 1) {
       const folder = index < renditions.length ? renditions[index].name : 'audio';
       const folderPath = join(outputDir, folder);
       await fs.mkdir(folderPath, { recursive: true });
+
       const initSource = join(outputDir, `init-${index}.m4s`);
-      if (existsSync(initSource)) await fs.rename(initSource, join(folderPath, 'init.m4s'));
+      if (existsSync(initSource)) {
+        await fs.rename(initSource, join(folderPath, 'init.m4s'));
+      }
+
       const entries = await fs.readdir(outputDir);
       const prefix = `chunk-${index}-`;
       for (const entry of entries) {
-        if (entry.startsWith(prefix) && entry.endsWith('.m4s')) {
-          await fs.rename(join(outputDir, entry), join(folderPath, entry.replace(prefix, 'chunk-')));
-        }
+        if (!entry.startsWith(prefix) || !entry.endsWith('.m4s')) continue;
+        await fs.rename(join(outputDir, entry), join(folderPath, entry.replace(prefix, 'chunk-')));
       }
 
       const playlistPath = join(outputDir, `media_${index}.m3u8`);
@@ -336,40 +457,78 @@ export class VideoService {
   private async validateOutputs(outputDir: string, renditions: Rendition[], hasAudio: boolean): Promise<void> {
     const manifestPath = join(outputDir, 'manifest.mpd');
     const masterPath = join(outputDir, 'master.m3u8');
+
     if (!existsSync(manifestPath)) {
       const files = await this.listOutputFiles(outputDir);
       throw new Error(`DASH manifest was not produced. Output files: ${files.join(', ') || 'none'}`);
     }
-    if (!existsSync(masterPath)) await this.createHlsMasterPlaylist(outputDir, renditions);
+
+    if (!existsSync(masterPath)) {
+      await this.createHlsMasterPlaylist(outputDir, renditions, hasAudio);
+    }
     if (!existsSync(masterPath)) throw new Error('HLS master playlist was not produced.');
+
     for (const rendition of renditions) {
       const folder = join(outputDir, rendition.name);
-      if (!existsSync(join(folder, 'init.m4s'))) throw new Error(`Missing ${rendition.name} initialization segment.`);
-      const chunks = (await fs.readdir(folder)).filter((file) => file.startsWith('chunk-') && file.endsWith('.m4s'));
+      if (!existsSync(join(folder, 'init.m4s'))) {
+        throw new Error(`Missing ${rendition.name} initialization segment.`);
+      }
+      const chunks = (await fs.readdir(folder)).filter(
+        (name) => name.startsWith('chunk-') && name.endsWith('.m4s'),
+      );
       if (!chunks.length) throw new Error(`Missing ${rendition.name} media segments.`);
     }
-    if (hasAudio && !existsSync(join(outputDir, 'audio', 'init.m4s'))) throw new Error('Missing audio initialization segment.');
+
+    if (hasAudio) {
+      const audioFolder = join(outputDir, 'audio');
+      if (!existsSync(join(audioFolder, 'init.m4s'))) throw new Error('Missing audio initialization segment.');
+      const audioChunks = (await fs.readdir(audioFolder)).filter(
+        (name) => name.startsWith('chunk-') && name.endsWith('.m4s'),
+      );
+      if (!audioChunks.length) throw new Error('Missing audio media segments.');
+    }
   }
 
-  private async createHlsMasterPlaylist(outputDir: string, renditions: Rendition[]): Promise<void> {
+  private async createHlsMasterPlaylist(
+    outputDir: string,
+    renditions: Rendition[],
+    hasAudio: boolean,
+  ): Promise<void> {
     const lines: string[] = ['#EXTM3U', '#EXT-X-VERSION:7'];
+
+    if (hasAudio && existsSync(join(outputDir, 'media_0.m3u8'))) {
+      lines.push('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="media_4.m3u8"');
+    }
+
     for (let index = 0; index < renditions.length; index += 1) {
       const playlist = join(outputDir, `media_${index}.m3u8`);
       if (!existsSync(playlist)) continue;
-      lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${Number.parseInt(renditions[index].bitrate, 10) * 1000}`);
+      const bandwidth = Number.parseInt(renditions[index].bitrate, 10) * 1000;
+      const audio = hasAudio ? ',AUDIO="audio"' : '';
+      lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${audio}`);
       lines.push(`media_${index}.m3u8`);
     }
-    if (lines.length > 2) await fs.writeFile(join(outputDir, 'master.m3u8'), `${lines.join('\n')}\n`, 'utf8');
+
+    if (lines.length > 2) {
+      await fs.writeFile(join(outputDir, 'master.m3u8'), `${lines.join('\n')}\n`, 'utf8');
+    }
   }
 
   private async listOutputFiles(root: string, prefix = ''): Promise<string[]> {
     const result: string[] = [];
-    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => [] as import('node:fs').Dirent[]);
+    const entries = await fs
+      .readdir(root, { withFileTypes: true })
+      .catch(() => [] as import('node:fs').Dirent[]);
+
     for (const entry of entries) {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) result.push(...await this.listOutputFiles(join(root, entry.name), relative));
-      else result.push(relative);
+      if (entry.isDirectory()) {
+        result.push(...(await this.listOutputFiles(join(root, entry.name), relative)));
+      } else {
+        result.push(relative);
+      }
     }
+
     return result;
   }
 
@@ -397,7 +556,9 @@ export class VideoService {
       const expired = (job.status === 'ready' || job.status === 'error') && age > this.ttlMs;
       const stuck = job.status === 'processing' && age > this.encodingTimeoutMs;
       const queuedTooLong = job.status === 'queued' && Date.parse(job.createdAt) < cutoff;
-      if (expired || stuck || queuedTooLong) await this.deleteJob(job.id);
+      if (expired || stuck || queuedTooLong) {
+        await this.deleteJob(job.id);
+      }
     }
   }
 }
