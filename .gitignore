@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/styles.css
+data/
+.env
+.DS_Store
+npm-debug.log*
