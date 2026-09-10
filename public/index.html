@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Fast guest video transcoding to HLS and MPEG-DASH." />
+  <title>FastStream Video</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.13/dist/hls.min.js"></script>
+  <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 antialiased">
+  <div class="pointer-events-none fixed inset-0 overflow-hidden">
+    <div class="absolute left-1/2 top-[-18rem] h-[32rem] w-[55rem] -translate-x-1/2 rounded-full bg-cyan-500/10 blur-3xl"></div>
+    <div class="absolute bottom-[-18rem] right-[-8rem] h-[30rem] w-[30rem] rounded-full bg-violet-500/10 blur-3xl"></div>
+  </div>
+
+  <main class="relative mx-auto flex min-h-screen w-full max-w-5xl flex-col px-5 py-8 sm:px-8 lg:px-10">
+    <header class="mb-10 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-white text-slate-950 shadow-lg shadow-white/5">
+          <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/></svg>
+        </div>
+        <div>
+          <p class="text-sm font-semibold tracking-wide text-white">FastStream</p>
+          <p class="text-xs text-slate-500">Guest video transcoder</p>
+        </div>
+      </div>
+      <div class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-slate-400">No account required</div>
+    </header>
+
+    <section class="mx-auto w-full max-w-3xl">
+      <div class="mb-9 text-center">
+        <div class="mb-5 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/5 px-3 py-1.5 text-xs font-medium text-cyan-200">
+          <span class="h-1.5 w-1.5 rounded-full bg-cyan-300"></span>
+          HLS + MPEG-DASH
+        </div>
+        <h1 class="text-4xl font-semibold tracking-tight text-white sm:text-5xl">Upload. Encode. Stream.</h1>
+        <p class="mx-auto mt-4 max-w-xl text-sm leading-6 text-slate-400 sm:text-base">Drop a video and the server automatically creates streaming-ready HLS and DASH output.</p>
+      </div>
+
+      <button id="uploadCard" type="button" class="group w-full rounded-3xl border border-dashed border-white/15 bg-white/[0.03] p-10 text-left transition hover:border-cyan-300/40 hover:bg-white/[0.05] sm:p-14">
+        <div class="flex flex-col items-center text-center">
+          <div class="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] transition group-hover:scale-105">
+            <svg class="h-7 w-7 text-cyan-200" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 16V4m0 0-4 4m4-4 4 4M5 13v4.5A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5V13" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <h2 class="text-lg font-medium text-white">Choose a video</h2>
+          <p class="mt-2 text-sm text-slate-500">MP4, MOV, WebM, MKV or AVI</p>
+          <span class="mt-6 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 transition group-hover:bg-cyan-100">Select video</span>
+        </div>
+      </button>
+      <input id="fileInput" type="file" class="hidden" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo,video/x-m4v" />
+
+      <div class="mt-5 grid gap-3 text-xs text-slate-500 sm:grid-cols-3">
+        <div class="rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3"><span class="text-slate-300">1.</span> Upload directly</div>
+        <div class="rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3"><span class="text-slate-300">2.</span> Fast FFmpeg encode</div>
+        <div class="rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3"><span class="text-slate-300">3.</span> Get stream URLs</div>
+      </div>
+
+      <section id="resultPanel" class="mt-8 hidden rounded-3xl border border-white/10 bg-white/[0.035] p-5 sm:p-7">
+        <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p class="text-xs uppercase tracking-[0.2em] text-slate-500">Your video</p>
+            <h2 id="resultTitle" class="mt-2 max-w-xl truncate text-xl font-medium text-white">Ready</h2>
+          </div>
+          <button id="clearButton" class="rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-slate-300 transition hover:bg-white/[0.08]">Clear</button>
+        </div>
+
+        <div class="mt-6 overflow-hidden rounded-2xl border border-white/10 bg-black">
+          <video id="player" class="aspect-video w-full bg-black" controls playsinline preload="metadata"></video>
+        </div>
+
+        <div class="mt-5 grid gap-3 sm:grid-cols-2">
+          <button id="hlsButton" class="rounded-xl border border-white/10 bg-cyan-400/10 px-4 py-3 text-left transition hover:bg-cyan-400/15">
+            <span class="block text-xs text-cyan-200">HLS</span>
+            <span id="hlsUrl" class="mt-1 block truncate text-sm text-slate-300">—</span>
+          </button>
+          <button id="dashButton" class="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-left transition hover:bg-white/[0.07]">
+            <span class="block text-xs text-slate-400">MPEG-DASH</span>
+            <span id="dashUrl" class="mt-1 block truncate text-sm text-slate-300">—</span>
+          </button>
+        </div>
+
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button id="watchButton" class="rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-cyan-100">Watch HLS</button>
+          <button id="copyHls" class="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm text-slate-300 hover:bg-white/[0.08]">Copy HLS URL</button>
+          <button id="copyDash" class="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm text-slate-300 hover:bg-white/[0.08]">Copy DASH URL</button>
+          <a id="downloadLink" class="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm text-slate-300 hover:bg-white/[0.08]" href="#" download>Open DASH</a>
+        </div>
+      </section>
+
+      <p class="mx-auto mt-8 max-w-xl text-center text-xs leading-5 text-slate-600">Files are temporary. A refresh starts a new browser session, and the server automatically removes old jobs.</p>
+    </section>
+  </main>
+
+  <div id="modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-950/80 p-5 backdrop-blur-sm">
+    <div id="modalCard" class="w-full max-w-md rounded-3xl border border-white/10 bg-slate-900 p-6 shadow-2xl shadow-black/50">
+      <div class="flex items-start gap-4">
+        <div id="modalIcon" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white/[0.06] text-cyan-200"></div>
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center justify-between gap-4">
+            <h3 id="modalTitle" class="text-base font-semibold text-white">Processing</h3>
+            <button id="modalClose" class="rounded-lg p-1.5 text-slate-500 hover:bg-white/[0.05] hover:text-slate-300" aria-label="Close">✕</button>
+          </div>
+          <p id="modalText" class="mt-2 text-sm leading-6 text-slate-400">Preparing your video…</p>
+        </div>
+      </div>
+      <div id="progressWrap" class="mt-5">
+        <div class="mb-2 flex items-center justify-between text-xs text-slate-500"><span id="progressLabel">Waiting</span><span id="progressPercent">0%</span></div>
+        <div class="h-2 overflow-hidden rounded-full bg-white/8"><div id="progressBar" class="h-full w-0 rounded-full bg-cyan-300 transition-all duration-300"></div></div>
+      </div>
+      <div id="modalActions" class="mt-5 hidden gap-2"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="pointer-events-none fixed bottom-5 left-1/2 z-[60] hidden -translate-x-1/2 rounded-xl border border-white/10 bg-slate-900/95 px-4 py-3 text-sm text-slate-200 shadow-xl"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
