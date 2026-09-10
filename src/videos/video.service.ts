@@ -50,8 +50,6 @@ export class VideoService {
   private readonly preset = process.env.FFMPEG_PRESET ?? 'veryfast';
 
   constructor() {
-    // This MUST finish before Nest starts accepting uploads. The previous async cleanup
-    // could delete a newly-created job while FFmpeg was writing its segments.
     this.resetStorageOnBoot();
     const timer = setInterval(() => void this.cleanupExpiredJobs(), 5 * 60_000);
     timer.unref();
@@ -119,6 +117,7 @@ export class VideoService {
       await fs.mkdir(outputDir, { recursive: true });
 
       await this.encodeWithFfmpeg({ id, inputPath, outputDir, duration, renditions, hasAudio });
+      await this.organizeOutputs(outputDir, renditions, hasAudio);
 
       const masterPath = join(outputDir, 'master.m3u8');
       const dashPath = join(outputDir, 'manifest.mpd');
@@ -126,11 +125,9 @@ export class VideoService {
         const contents = await this.listOutputFiles(outputDir);
         throw new Error(`FFmpeg completed without producing manifest.mpd. Output files: ${contents.join(', ') || 'none'}`);
       }
-
       if (!existsSync(masterPath)) {
         await this.createHlsMasterPlaylist(outputDir, renditions);
       }
-
       if (!existsSync(masterPath)) {
         throw new Error('FFmpeg completed, but the HLS master playlist could not be created.');
       }
@@ -200,7 +197,6 @@ export class VideoService {
     const filterParts: string[] = [];
     const splitLabels = renditions.map((_, index) => `[v${index}]`).join('');
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
-
     renditions.forEach((rendition, index) => {
       filterParts.push(
         `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`,
@@ -234,6 +230,9 @@ export class VideoService {
       ? `id=0,streams=${videoIndexes} id=1,streams=${renditions.length}`
       : `id=0,streams=${videoIndexes}`;
 
+    // IMPORTANT: do not put $RepresentationID$ in a directory path here.
+    // FFmpeg's DASH muxer has produced ENOENT on Windows for that nested path.
+    // The application creates the representation folders after FFmpeg finishes.
     args.push(
       '-f', 'dash',
       '-dash_segment_type', 'mp4',
@@ -245,18 +244,12 @@ export class VideoService {
       '-hls_playlist', '1',
       '-hls_master_name', 'master.m3u8',
       '-adaptation_sets', adaptationSets,
-      '-init_seg_name', '$RepresentationID$/init.m4s',
-      '-media_seg_name', '$RepresentationID$/chunk-$Number%05d$.m4s',
+      '-init_seg_name', 'init-$RepresentationID$.m4s',
+      '-media_seg_name', 'chunk-$RepresentationID$-$Number%05d$.m4s',
       '-progress', 'pipe:1',
       '-nostats',
       join(outputDir, 'manifest.mpd'),
     );
-
-    // Directories must exist before FFmpeg starts. With startup cleanup now synchronous,
-    // these directories cannot be deleted underneath the encoder.
-    for (let index = 0; index < renditions.length + (hasAudio ? 1 : 0); index += 1) {
-      await fs.mkdir(join(outputDir, String(index)), { recursive: true });
-    }
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -322,22 +315,62 @@ export class VideoService {
     });
   }
 
-  private async createHlsMasterPlaylist(outputDir: string, renditions: Rendition[]): Promise<void> {
-    const playlistEntries: string[] = ['#EXTM3U', '#EXT-X-VERSION:7'];
+  private async organizeOutputs(outputDir: string, renditions: Rendition[], hasAudio: boolean): Promise<void> {
+    const totalStreams = renditions.length + (hasAudio ? 1 : 0);
 
+    for (let index = 0; index < totalStreams; index += 1) {
+      const folder = hasAudio && index === renditions.length ? 'audio' : renditions[index]?.name ?? `${index}`;
+      const folderPath = join(outputDir, folder);
+      await fs.mkdir(folderPath, { recursive: true });
+
+      const initName = `init-${index}.m4s`;
+      const initSource = join(outputDir, initName);
+      if (existsSync(initSource)) {
+        await fs.rename(initSource, join(folderPath, initName));
+      }
+
+      const entries = await fs.readdir(outputDir);
+      const chunkPrefix = `chunk-${index}-`;
+      for (const entry of entries) {
+        if (!entry.startsWith(chunkPrefix) || !entry.endsWith('.m4s')) continue;
+        await fs.rename(join(outputDir, entry), join(folderPath, entry));
+      }
+
+      const playlistPath = join(outputDir, `media_${index}.m3u8`);
+      if (existsSync(playlistPath)) {
+        let playlist = await fs.readFile(playlistPath, 'utf8');
+        playlist = playlist
+          .replace(new RegExp(`(?<![\\w/])chunk-${index}-(\\d+)\\.m4s`, 'g'), `${folder}/chunk-${index}-$1.m4s`)
+          .replace(new RegExp(`(?<![\\w/])init-${index}\\.m4s`, 'g'), `${folder}/init-${index}.m4s`);
+        await fs.writeFile(playlistPath, playlist, 'utf8');
+      }
+    }
+
+    const dashPath = join(outputDir, 'manifest.mpd');
+    if (existsSync(dashPath)) {
+      let manifest = await fs.readFile(dashPath, 'utf8');
+      for (let index = 0; index < totalStreams; index += 1) {
+        const folder = hasAudio && index === renditions.length ? 'audio' : renditions[index]?.name ?? `${index}`;
+        manifest = manifest
+          .replace(new RegExp(`(?<![\\w/])init-${index}\\.m4s`, 'g'), `${folder}/init-${index}.m4s`)
+          .replace(new RegExp(`(?<![\\w/])chunk-${index}-`, 'g'), `${folder}/chunk-${index}-`);
+      }
+      await fs.writeFile(dashPath, manifest, 'utf8');
+    }
+  }
+
+  private async createHlsMasterPlaylist(outputDir: string, renditions: Rendition[]): Promise<void> {
+    const entries: string[] = ['#EXTM3U', '#EXT-X-VERSION:7'];
     for (let index = 0; index < renditions.length; index += 1) {
       const playlistPath = join(outputDir, `media_${index}.m3u8`);
       if (!existsSync(playlistPath)) continue;
-      const rendition = renditions[index];
-      const bitrate = Number.parseInt(rendition.bitrate, 10) * 1000;
-      // Actual encoded dimensions are portrait for the supplied 720x1280 sample.
-      // The media playlist itself remains authoritative for playback.
-      playlistEntries.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bitrate}`);
-      playlistEntries.push(`media_${index}.m3u8`);
+      const bitrate = Number.parseInt(renditions[index].bitrate, 10) * 1000;
+      entries.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bitrate}`);
+      entries.push(`media_${index}.m3u8`);
     }
-
-    if (playlistEntries.length <= 2) return;
-    await fs.writeFile(join(outputDir, 'master.m3u8'), `${playlistEntries.join('\n')}\n`, 'utf8');
+    if (entries.length > 2) {
+      await fs.writeFile(join(outputDir, 'master.m3u8'), `${entries.join('\n')}\n`, 'utf8');
+    }
   }
 
   private async listOutputFiles(root: string, prefix = ''): Promise<string[]> {
@@ -362,7 +395,6 @@ export class VideoService {
   }
 
   private resetStorageOnBoot(): void {
-    // Synchronous on purpose: upload routes must not be available until this finishes.
     rmSync(this.jobsRoot, { recursive: true, force: true });
     mkdirSync(this.jobsRoot, { recursive: true });
     rmSync(this.uploadRoot, { recursive: true, force: true });
