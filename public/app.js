@@ -112,7 +112,12 @@ function playDash() {
 }
 
 function copyText(text, label) {
-  navigator.clipboard?.writeText(new URL(text, window.location.origin).href)
+  const absolute = new URL(text, window.location.origin).href;
+  if (!navigator.clipboard) {
+    showToast('Clipboard unavailable in this browser');
+    return;
+  }
+  navigator.clipboard.writeText(absolute)
     .then(() => showToast(`${label} copied`))
     .catch(() => showToast('Copy failed.'));
 }
@@ -170,7 +175,6 @@ async function pollStatus() {
     if (job.status === 'error') {
       window.clearInterval(pollTimer);
       openModal({ title: 'Encoding failed', text: job.error || 'The server could not encode this video.', icon: icons.error, progress: false });
-      return;
     }
   } catch (_) {
     // Brief network hiccups should not interrupt encoding.
@@ -231,12 +235,15 @@ fileInput.addEventListener('change', () => {
 });
 
 hlsButton.addEventListener('click', () => copyText(currentHls, 'HLS URL'));
+
 dashButton.addEventListener('click', () => copyText(currentDash, 'DASH URL'));
 copyHls.addEventListener('click', () => copyText(currentHls, 'HLS URL'));
 copyDash.addEventListener('click', () => copyText(currentDash, 'DASH URL'));
 watchButton.addEventListener('click', playHls);
 
 dashButton.addEventListener('dblclick', playDash);
+
+downloadLink.addEventListener('click', () => showToast('Opening DASH manifest'));
 
 clearButton.addEventListener('click', () => {
   openModal({ title: 'Clear this video?', text: 'The temporary files will be removed from the server.', icon: icons.error, progress: false, closeable: true });
@@ -272,6 +279,6 @@ modal.addEventListener('click', (event) => {
 
 window.addEventListener('pagehide', () => {
   if (activeJobId) {
-    navigator.sendBeacon(`/api/videos/${activeJobId}`, new Blob([], { type: 'application/octet-stream' }));
+    navigator.sendBeacon(`/api/videos/${activeJobId}/cleanup`, new Blob([], { type: 'application/octet-stream' }));
   }
 });
