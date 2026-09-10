@@ -15,7 +15,9 @@ const mediaHeaders = (response: { setHeader: (name: string, value: string) => vo
     ServeStaticModule.forRoot({
       rootPath: join(process.cwd(), 'data', 'jobs'),
       serveRoot: '/media',
-      setHeaders: mediaHeaders,
+      serveStaticOptions: {
+        setHeaders: mediaHeaders,
+      },
     }),
     ServeStaticModule.forRoot({
       rootPath: join(process.cwd(), 'public'),
