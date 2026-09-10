@@ -6,11 +6,11 @@
   "scripts": {
     "build": "nest build && npm run web:build",
     "web:build": "tailwindcss -i ./public/input.css -o ./public/styles.css --minify",
+    "prestart": "npm run web:build",
     "start": "node dist/main.js",
+    "prestart:dev": "npm run web:build",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main.js",
-    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
-    "format": "prettier --write \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
