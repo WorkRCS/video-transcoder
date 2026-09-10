@@ -53,11 +53,7 @@ export class VideosController {
     }),
   )
   upload(
-    @UploadedFile(
-      new ParseFilePipeBuilder()
-        .addMaxSize(Number(process.env.MAX_UPLOAD_MB ?? 1024) * 1024 * 1024)
-        .build({ fileIsRequired: true }),
-    )
+    @UploadedFile(new ParseFilePipeBuilder().build({ fileIsRequired: true }))
     file: Express.Multer.File,
   ) {
     const job = this.videoService.createJob(file);
