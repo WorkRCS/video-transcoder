@@ -230,11 +230,11 @@ export class VideoService {
 
     args.push(
       '-f', 'dash',
+      '-dash_segment_type', 'mp4',
       '-seg_duration', '4',
       '-frag_duration', '1',
       '-use_template', '1',
       '-use_timeline', '1',
-      '-streaming', '1',
       '-remove_at_exit', '0',
       '-hls_playlist', '1',
       '-hls_master_name', 'master.m3u8',
@@ -287,7 +287,7 @@ export class VideoService {
       child.stderr.on('data', (chunk: Buffer) => {
         const lines = chunk.toString('utf8').split(/\r?\n/).filter(Boolean);
         stderrTail.push(...lines);
-        while (stderrTail.length > 25) stderrTail.shift();
+        while (stderrTail.length > 100) stderrTail.shift();
       });
 
       child.on('error', (error) => {
@@ -306,7 +306,7 @@ export class VideoService {
           resolve();
           return;
         }
-        finishError(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-4000)}`));
+        finishError(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-8000)}`));
       });
     });
   }
