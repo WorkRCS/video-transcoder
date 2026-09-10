@@ -195,7 +195,7 @@ export class VideoService {
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
     renditions.forEach((rendition, index) => {
       filterParts.push(
-        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,setsar=1[out${index}]`,
+        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`,
       );
       if (index !== renditions.length - 1) filterParts.push(';');
     });
