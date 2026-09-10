@@ -115,13 +115,12 @@ export class VideoService {
       const outputDir = join(this.jobsRoot, id, 'stream');
       await fs.mkdir(outputDir, { recursive: true });
 
-      const renditions = this.getRenditions(sourceHeight);
       await this.encodeWithFfmpeg({
         id,
         inputPath,
         outputDir,
         duration,
-        renditions,
+        renditions: this.getRenditions(sourceHeight),
         hasAudio,
       });
 
@@ -193,7 +192,6 @@ export class VideoService {
     const { id, inputPath, outputDir, duration, renditions, hasAudio } = params;
     const filterParts: string[] = [];
     const splitLabels = renditions.map((_, index) => `[v${index}]`).join('');
-    const outputLabels = renditions.map((_, index) => `[out${index}]`).join('');
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
     renditions.forEach((rendition, index) => {
       filterParts.push(
@@ -202,12 +200,20 @@ export class VideoService {
       if (index !== renditions.length - 1) filterParts.push(';');
     });
 
-    const args: string[] = ['-hide_banner', '-y', '-i', inputPath, '-filter_complex', filterParts.join('')];
+    const args: string[] = [
+      '-hide_banner',
+      '-y',
+      '-i',
+      inputPath,
+      '-filter_complex',
+      filterParts.join(''),
+    ];
+
     renditions.forEach((rendition, index) => {
-      args.push('-map', outputLabels.split('[').filter(Boolean)[index].replace(']', '').replace(/^/, '['));
+      args.push('-map', `[out${index}]`);
       args.push(
         `-c:v:${index}`, 'libx264',
-        `-preset`, this.preset,
+        '-preset', this.preset,
         `-b:v:${index}`, rendition.bitrate,
         `-maxrate:v:${index}`, rendition.maxrate,
         `-bufsize:v:${index}`, rendition.bufsize,
@@ -267,7 +273,7 @@ export class VideoService {
           if (!value) continue;
           if (key === 'out_time_us' || key === 'out_time_ms') {
             const raw = Number(value);
-            const seconds = key === 'out_time_us' ? raw / 1_000_000 : raw / 1_000_000;
+            const seconds = raw / 1_000_000;
             const ratio = duration > 0 ? Math.min(1, seconds / duration) : 0;
             const currentJob = this.jobs.get(id);
             if (currentJob) {
@@ -333,7 +339,8 @@ export class VideoService {
       const age = Date.now() - Date.parse(job.updatedAt);
       const expired = (job.status === 'ready' || job.status === 'error') && age > this.ttlMs;
       const stuck = job.status === 'processing' && age > this.encodingTimeoutMs;
-      if (expired || stuck || Date.parse(job.createdAt) < cutoff && job.status === 'queued') {
+      const abandonedQueue = job.status === 'queued' && Date.parse(job.createdAt) < cutoff;
+      if (expired || stuck || abandonedQueue) {
         await this.deleteJob(job.id);
       }
     }
