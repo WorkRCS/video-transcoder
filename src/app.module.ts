@@ -6,8 +6,11 @@ import { VideosModule } from './videos/videos.module';
 @Module({
   imports: [
     ServeStaticModule.forRoot({
+      rootPath: join(process.cwd(), 'data', 'jobs'),
+      serveRoot: '/media',
+    }),
+    ServeStaticModule.forRoot({
       rootPath: join(process.cwd(), 'public'),
-      exclude: ['/api/{*splat}'],
     }),
     VideosModule,
   ],
