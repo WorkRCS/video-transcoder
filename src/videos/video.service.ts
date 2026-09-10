@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { spawn, execFile } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -50,8 +50,9 @@ export class VideoService {
   private readonly preset = process.env.FFMPEG_PRESET ?? 'veryfast';
 
   constructor() {
-    this.ensureDirectories();
-    void this.resetStorageOnBoot();
+    // This MUST finish before Nest starts accepting uploads. The previous async cleanup
+    // could delete a newly-created job while FFmpeg was writing its segments.
+    this.resetStorageOnBoot();
     const timer = setInterval(() => void this.cleanupExpiredJobs(), 5 * 60_000);
     timer.unref();
   }
@@ -89,8 +90,6 @@ export class VideoService {
   }
 
   async deleteJob(id: string): Promise<void> {
-    const job = this.jobs.get(id);
-    if (!job) return;
     this.jobs.delete(id);
     await fs.rm(join(this.jobsRoot, id), { recursive: true, force: true });
   }
@@ -107,27 +106,19 @@ export class VideoService {
       const probe = await this.probe(inputPath);
       const duration = Number(probe.format?.duration ?? 0);
       const videoStream = probe.streams?.find((stream) => stream.codec_type === 'video');
-      const sourceWidth = videoStream?.width ?? 1280;
       const sourceHeight = videoStream?.height ?? 720;
       const hasAudio = probe.streams?.some((stream) => stream.codec_type === 'audio') ?? false;
+      const renditions = this.getRenditions(sourceHeight);
 
       job.durationSeconds = Number.isFinite(duration) ? duration : undefined;
       job.sourceHeight = sourceHeight;
       job.updatedAt = new Date().toISOString();
 
       const outputDir = join(this.jobsRoot, id, 'stream');
+      await fs.rm(outputDir, { recursive: true, force: true });
       await fs.mkdir(outputDir, { recursive: true });
 
-      await this.encodeWithFfmpeg({
-        id,
-        inputPath,
-        outputDir,
-        duration,
-        sourceWidth,
-        sourceHeight,
-        renditions: this.getRenditions(sourceHeight),
-        hasAudio,
-      });
+      await this.encodeWithFfmpeg({ id, inputPath, outputDir, duration, renditions, hasAudio });
 
       const masterPath = join(outputDir, 'master.m3u8');
       const dashPath = join(outputDir, 'manifest.mpd');
@@ -135,9 +126,11 @@ export class VideoService {
         const contents = await this.listOutputFiles(outputDir);
         throw new Error(`FFmpeg completed without producing manifest.mpd. Output files: ${contents.join(', ') || 'none'}`);
       }
+
       if (!existsSync(masterPath)) {
-        await this.createHlsMasterPlaylist(outputDir, this.getRenditions(sourceHeight));
+        await this.createHlsMasterPlaylist(outputDir, renditions);
       }
+
       if (!existsSync(masterPath)) {
         throw new Error('FFmpeg completed, but the HLS master playlist could not be created.');
       }
@@ -147,6 +140,7 @@ export class VideoService {
       job.hlsUrl = `/media/${id}/stream/master.m3u8`;
       job.dashUrl = `/media/${id}/stream/manifest.mpd`;
       job.updatedAt = new Date().toISOString();
+      console.log(`[transcoder:${id}] ready`);
     } catch (error: unknown) {
       this.failJob(id, error);
     }
@@ -160,16 +154,11 @@ export class VideoService {
       { name: '360p', height: 360, bitrate: '800k', maxrate: '856k', bufsize: '1600k' },
     ];
 
-    const available = candidates.filter((r) => sourceHeight >= r.height);
-    return available.length > 0
-      ? available
-      : [{
-          name: `${Math.max(240, Math.floor(sourceHeight / 2) * 2)}p`,
-          height: Math.max(240, Math.floor(sourceHeight / 2) * 2),
-          bitrate: '800k',
-          maxrate: '856k',
-          bufsize: '1600k',
-        }];
+    const available = candidates.filter((rendition) => sourceHeight >= rendition.height);
+    if (available.length > 0) return available;
+
+    const height = Math.max(240, Math.floor(sourceHeight / 2) * 2);
+    return [{ name: `${height}p`, height, bitrate: '800k', maxrate: '856k', bufsize: '1600k' }];
   }
 
   private async probe(inputPath: string): Promise<ProbeResult> {
@@ -201,18 +190,17 @@ export class VideoService {
     inputPath: string;
     outputDir: string;
     duration: number;
-    sourceWidth: number;
-    sourceHeight: number;
     renditions: Rendition[];
     hasAudio: boolean;
   }): Promise<void> {
     const executable = ffmpegPath;
     if (!executable) throw new InternalServerErrorException('FFmpeg binary is unavailable.');
 
-    const { id, inputPath, outputDir, duration, sourceWidth, sourceHeight, renditions, hasAudio } = params;
+    const { id, inputPath, outputDir, duration, renditions, hasAudio } = params;
     const filterParts: string[] = [];
     const splitLabels = renditions.map((_, index) => `[v${index}]`).join('');
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
+
     renditions.forEach((rendition, index) => {
       filterParts.push(
         `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`,
@@ -220,14 +208,7 @@ export class VideoService {
       if (index !== renditions.length - 1) filterParts.push(';');
     });
 
-    const args: string[] = [
-      '-hide_banner',
-      '-y',
-      '-i',
-      inputPath,
-      '-filter_complex',
-      filterParts.join(''),
-    ];
+    const args: string[] = ['-hide_banner', '-y', '-i', inputPath, '-filter_complex', filterParts.join('')];
 
     renditions.forEach((rendition, index) => {
       args.push('-map', `[out${index}]`);
@@ -248,13 +229,11 @@ export class VideoService {
       args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
     }
 
-    const videoStreamIndexes = renditions.map((_, index) => index).join(',');
+    const videoIndexes = renditions.map((_, index) => index).join(',');
     const adaptationSets = hasAudio
-      ? `id=0,streams=${videoStreamIndexes} id=1,streams=${renditions.length}`
-      : `id=0,streams=${videoStreamIndexes}`;
+      ? `id=0,streams=${videoIndexes} id=1,streams=${renditions.length}`
+      : `id=0,streams=${videoIndexes}`;
 
-    // RepresentationID-based directories keep each encoded representation isolated:
-    // stream/0/, stream/1/, stream/2/, ...; the root retains the DASH MPD and HLS playlists.
     args.push(
       '-f', 'dash',
       '-dash_segment_type', 'mp4',
@@ -273,7 +252,8 @@ export class VideoService {
       join(outputDir, 'manifest.mpd'),
     );
 
-    await fs.mkdir(outputDir, { recursive: true });
+    // Directories must exist before FFmpeg starts. With startup cleanup now synchronous,
+    // these directories cannot be deleted underneath the encoder.
     for (let index = 0; index < renditions.length + (hasAudio ? 1 : 0); index += 1) {
       await fs.mkdir(join(outputDir, String(index)), { recursive: true });
     }
@@ -304,8 +284,7 @@ export class VideoService {
           const [key, value] = line.split('=', 2);
           if (!value) continue;
           if (key === 'out_time_us' || key === 'out_time_ms') {
-            const raw = Number(value);
-            const seconds = raw / 1_000_000;
+            const seconds = Number(value) / 1_000_000;
             const ratio = duration > 0 ? Math.min(1, seconds / duration) : 0;
             const currentJob = this.jobs.get(id);
             if (currentJob) {
@@ -334,7 +313,7 @@ export class VideoService {
           finished = true;
           const currentJob = this.jobs.get(id);
           if (currentJob) currentJob.progress = 98;
-          console.log(`[transcoder:${id}] completed in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+          console.log(`[transcoder:${id}] FFmpeg completed in ${Math.round((Date.now() - startedAt) / 1000)}s`);
           resolve();
           return;
         }
@@ -344,27 +323,21 @@ export class VideoService {
   }
 
   private async createHlsMasterPlaylist(outputDir: string, renditions: Rendition[]): Promise<void> {
-    const mediaPlaylists: Array<{ name: string; bitrate: number; resolution: string }> = [];
+    const playlistEntries: string[] = ['#EXTM3U', '#EXT-X-VERSION:7'];
+
     for (let index = 0; index < renditions.length; index += 1) {
       const playlistPath = join(outputDir, `media_${index}.m3u8`);
       if (!existsSync(playlistPath)) continue;
       const rendition = renditions[index];
       const bitrate = Number.parseInt(rendition.bitrate, 10) * 1000;
-      const width = Math.max(2, Math.round((rendition.height * 9) / 16 / 2) * 2);
-      mediaPlaylists.push({
-        name: `media_${index}.m3u8`,
-        bitrate,
-        resolution: `${width}x${rendition.height}`,
-      });
+      // Actual encoded dimensions are portrait for the supplied 720x1280 sample.
+      // The media playlist itself remains authoritative for playback.
+      playlistEntries.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bitrate}`);
+      playlistEntries.push(`media_${index}.m3u8`);
     }
-    if (mediaPlaylists.length === 0) return;
 
-    const lines = ['#EXTM3U', '#EXT-X-VERSION:7'];
-    for (const playlist of mediaPlaylists) {
-      lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${playlist.bitrate},RESOLUTION=${playlist.resolution}`);
-      lines.push(playlist.name);
-    }
-    await fs.writeFile(join(outputDir, 'master.m3u8'), `${lines.join('\n')}\n`, 'utf8');
+    if (playlistEntries.length <= 2) return;
+    await fs.writeFile(join(outputDir, 'master.m3u8'), `${playlistEntries.join('\n')}\n`, 'utf8');
   }
 
   private async listOutputFiles(root: string, prefix = ''): Promise<string[]> {
@@ -388,16 +361,12 @@ export class VideoService {
     console.error(`[transcoder:${id}] ${job.error}`);
   }
 
-  private ensureDirectories(): void {
+  private resetStorageOnBoot(): void {
+    // Synchronous on purpose: upload routes must not be available until this finishes.
+    rmSync(this.jobsRoot, { recursive: true, force: true });
     mkdirSync(this.jobsRoot, { recursive: true });
+    rmSync(this.uploadRoot, { recursive: true, force: true });
     mkdirSync(this.uploadRoot, { recursive: true });
-  }
-
-  private async resetStorageOnBoot(): Promise<void> {
-    await fs.rm(this.jobsRoot, { recursive: true, force: true });
-    await fs.mkdir(this.jobsRoot, { recursive: true });
-    await fs.rm(this.uploadRoot, { recursive: true, force: true });
-    await fs.mkdir(this.uploadRoot, { recursive: true });
   }
 
   private async cleanupExpiredJobs(): Promise<void> {
