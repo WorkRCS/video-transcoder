@@ -85,6 +85,12 @@ export class VideosController {
     };
   }
 
+  @Post(':id/cleanup')
+  @HttpCode(204)
+  async cleanup(@Param('id') id: string): Promise<void> {
+    await this.videoService.deleteJob(id);
+  }
+
   @Delete(':id')
   @HttpCode(204)
   async remove(@Param('id') id: string): Promise<void> {
