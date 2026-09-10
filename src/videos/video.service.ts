@@ -265,17 +265,16 @@ export class VideoService {
     if (!executable) throw new InternalServerErrorException('FFmpeg binary is unavailable.');
 
     const { id, inputPath, outputDir, duration, sourceWidth, sourceHeight, renditions, hasAudio } = params;
-    const sourceDar = `${sourceWidth}/${sourceHeight}`;
     const labels = renditions.map((_, index) => `[v${index}]`).join('');
     const filters = [`[0:v]split=${renditions.length}${labels}`];
 
     for (let index = 0; index < renditions.length; index += 1) {
       const rendition = renditions[index];
-      // Do not crop to a pixel-only ratio and then force SAR=1. That creates tiny
-      // DAR differences such as 608x1080 vs 404x720, which FFmpeg's DASH muxer rejects.
-      // setdar preserves the original display aspect ratio across every rendition.
+      // Keep exact source display aspect ratio even when the encoder must round width to an even number.
+      // setsar uses the post-scale width (iw), so every output gets the exact same display aspect ratio.
+      const dar = `${sourceWidth}/${sourceHeight}`;
       filters.push(
-        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,setdar=${sourceDar}[out${index}]`,
+        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,setsar='(${sourceWidth}*${rendition.height})/(${sourceHeight}*iw)'[out${index}]`,
       );
     }
 
@@ -317,6 +316,9 @@ export class VideoService {
       args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
     }
 
+    const streamIds = renditions.map((_, index) => index).join(',');
+    const audioIndex = renditions.length;
+
     args.push(
       '-f',
       'dash',
@@ -337,7 +339,7 @@ export class VideoService {
       '-hls_master_name',
       'master.m3u8',
       '-adaptation_sets',
-      hasAudio ? 'id=0,streams=v id=1,streams=a' : 'id=0,streams=v',
+      hasAudio ? `id=0,streams=${streamIds} id=1,streams=${audioIndex}` : `id=0,streams=${streamIds}`,
       '-init_seg_name',
       'init-$RepresentationID$.m4s',
       '-media_seg_name',
@@ -495,9 +497,12 @@ export class VideoService {
     hasAudio: boolean,
   ): Promise<void> {
     const lines: string[] = ['#EXTM3U', '#EXT-X-VERSION:7'];
+    const audioPlaylistIndex = renditions.length;
 
-    if (hasAudio && existsSync(join(outputDir, 'media_0.m3u8'))) {
-      lines.push('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="media_4.m3u8"');
+    if (hasAudio && existsSync(join(outputDir, `media_${audioPlaylistIndex}.m3u8`))) {
+      lines.push(
+        `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="media_${audioPlaylistIndex}.m3u8"`,
+      );
     }
 
     for (let index = 0; index < renditions.length; index += 1) {
