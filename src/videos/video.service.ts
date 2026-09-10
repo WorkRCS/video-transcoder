@@ -178,7 +178,7 @@ export class VideoService {
       this.failJob(id, error);
     } finally {
       const current = this.jobs.get(id);
-      if (current) delete current.inputPath;
+      if (current) current.inputPath = current.inputPath;
       this.processes.delete(id);
     }
   }
@@ -206,11 +206,8 @@ export class VideoService {
         { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout, stderr) => {
           if (error) return reject(new Error(`Unable to inspect video: ${stderr || error.message}`));
-          try {
-            resolve(JSON.parse(stdout) as ProbeResult);
-          } catch {
-            reject(new Error('FFprobe returned invalid metadata.'));
-          }
+          try { resolve(JSON.parse(stdout) as ProbeResult); }
+          catch { reject(new Error('FFprobe returned invalid metadata.')); }
         },
       );
     });
@@ -260,7 +257,6 @@ export class VideoService {
       let stdoutBuffer = '';
       const stderrTail: string[] = [];
       let settled = false;
-      const startedAt = Date.now();
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -294,12 +290,8 @@ export class VideoService {
       child.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (settled) return;
-        if (code === 0) {
-          console.log(`[transcoder:${id}] FFmpeg completed in ${Math.round((Date.now() - startedAt) / 1000)}s`);
-          finish();
-          return;
-        }
-        finish(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-12000)}`));
+        if (code === 0) finish();
+        else finish(new Error(`FFmpeg failed (${code ?? 'no-code'}${signal ? `/${signal}` : ''}): ${stderrTail.join('\n').slice(-12000)}`));
       });
     });
   }
@@ -319,6 +311,14 @@ export class VideoService {
           await fs.rename(join(outputDir, entry), join(folderPath, entry.replace(prefix, 'chunk-')));
         }
       }
+
+      const playlistPath = join(outputDir, `media_${index}.m3u8`);
+      if (existsSync(playlistPath)) {
+        let playlist = await fs.readFile(playlistPath, 'utf8');
+        playlist = playlist.replace(new RegExp(`init-${index}\\.m4s`, 'g'), `${folder}/init.m4s`);
+        playlist = playlist.replace(new RegExp(`chunk-${index}-`, 'g'), `${folder}/chunk-`);
+        await fs.writeFile(playlistPath, playlist, 'utf8');
+      }
     }
 
     const mpdPath = join(outputDir, 'manifest.mpd');
@@ -331,9 +331,6 @@ export class VideoService {
       }
       await fs.writeFile(mpdPath, mpd, 'utf8');
     }
-
-    // Keep media playlists at stream root because FFmpeg's generated master playlist references them there.
-    // Their segment URIs are rewritten above by replacing chunk names with their rendition directory paths.
   }
 
   private async validateOutputs(outputDir: string, renditions: Rendition[], hasAudio: boolean): Promise<void> {
@@ -345,7 +342,6 @@ export class VideoService {
     }
     if (!existsSync(masterPath)) await this.createHlsMasterPlaylist(outputDir, renditions);
     if (!existsSync(masterPath)) throw new Error('HLS master playlist was not produced.');
-
     for (const rendition of renditions) {
       const folder = join(outputDir, rendition.name);
       if (!existsSync(join(folder, 'init.m4s'))) throw new Error(`Missing ${rendition.name} initialization segment.`);
