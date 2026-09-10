@@ -19,7 +19,7 @@
     "@nestjs/platform-express": "^11.1.6",
     "@nestjs/serve-static": "^5.0.4",
     "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^5.2.0",
+    "ffprobe-static": "3.1.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   },
@@ -33,7 +33,6 @@
     "@types/node": "^22.18.3",
     "eslint": "^9.35.0",
     "prettier": "^3.6.2",
-    "tailwindcss": "^4.1.13",
     "ts-node": "^10.9.2",
     "ts-loader": "^9.5.4",
     "ts-node-dev": "^2.0.0",
