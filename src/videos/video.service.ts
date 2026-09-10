@@ -105,7 +105,9 @@ export class VideoService {
 
       const probe = await this.probe(inputPath);
       const duration = Number(probe.format?.duration ?? 0);
-      const sourceHeight = probe.streams?.find((stream) => stream.codec_type === 'video')?.height ?? 720;
+      const videoStream = probe.streams?.find((stream) => stream.codec_type === 'video');
+      const sourceWidth = videoStream?.width ?? 1280;
+      const sourceHeight = videoStream?.height ?? 720;
       const hasAudio = probe.streams?.some((stream) => stream.codec_type === 'audio') ?? false;
 
       job.durationSeconds = Number.isFinite(duration) ? duration : undefined;
@@ -120,6 +122,8 @@ export class VideoService {
         inputPath,
         outputDir,
         duration,
+        sourceWidth,
+        sourceHeight,
         renditions: this.getRenditions(sourceHeight),
         hasAudio,
       });
@@ -183,19 +187,22 @@ export class VideoService {
     inputPath: string;
     outputDir: string;
     duration: number;
+    sourceWidth: number;
+    sourceHeight: number;
     renditions: Rendition[];
     hasAudio: boolean;
   }): Promise<void> {
     const executable = ffmpegPath;
     if (!executable) throw new InternalServerErrorException('FFmpeg binary is unavailable.');
 
-    const { id, inputPath, outputDir, duration, renditions, hasAudio } = params;
+    const { id, inputPath, outputDir, duration, sourceWidth, sourceHeight, renditions, hasAudio } = params;
     const filterParts: string[] = [];
     const splitLabels = renditions.map((_, index) => `[v${index}]`).join('');
+    const sourceDar = sourceHeight > 0 ? `${sourceWidth}/${sourceHeight}` : '16/9';
     filterParts.push(`[0:v]split=${renditions.length}${splitLabels};`);
     renditions.forEach((rendition, index) => {
       filterParts.push(
-        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1[out${index}]`,
+        `[v${index}]scale=w=-2:h=${rendition.height}:force_original_aspect_ratio=decrease,crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2,setsar=1,setdar=${sourceDar}[out${index}]`,
       );
       if (index !== renditions.length - 1) filterParts.push(';');
     });
@@ -228,6 +235,11 @@ export class VideoService {
       args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
     }
 
+    const videoStreamIndexes = renditions.map((_, index) => index).join(',');
+    const adaptationSets = hasAudio
+      ? `id=0,streams=${videoStreamIndexes} id=1,streams=${renditions.length}`
+      : `id=0,streams=${videoStreamIndexes}`;
+
     args.push(
       '-f', 'dash',
       '-dash_segment_type', 'mp4',
@@ -238,7 +250,7 @@ export class VideoService {
       '-remove_at_exit', '0',
       '-hls_playlist', '1',
       '-hls_master_name', 'master.m3u8',
-      '-adaptation_sets', hasAudio ? 'id=0,streams=v id=1,streams=a' : 'id=0,streams=v',
+      '-adaptation_sets', adaptationSets,
       '-init_seg_name', 'init-$RepresentationID$.m4s',
       '-media_seg_name', 'chunk-$RepresentationID$-$Number%05d$.m4s',
       '-progress', 'pipe:1',
